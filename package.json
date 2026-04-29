@@ -1,0 +1,37 @@
+{
+  "name": "insighta-backend",
+  "version": "1.0.0",
+  "description": "Insighta Labs+ Backend API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "migrate": "node migrate.js",
+    "seed": "node seed.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cybarry/insighta-backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/cybarry/insighta-backend/issues"
+  },
+  "homepage": "https://github.com/cybarry/insighta-backend#readme",
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/cors": "^11.2.0",
+    "@fastify/csrf-protection": "^7.1.0",
+    "@fastify/jwt": "^10.0.0",
+    "@fastify/rate-limit": "^10.3.0",
+    "axios": "^1.15.2",
+    "dotenv": "^17.4.2",
+    "fastify": "^5.8.5",
+    "knex": "^3.2.9",
+    "pg": "^8.20.0",
+    "uuidv7": "^1.2.1"
+  }
+}
