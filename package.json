@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Insighta Labs+ Backend API",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
@@ -16,7 +17,6 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "bugs": {
     "url": "https://github.com/cybarry/insighta-backend/issues"
   },
@@ -30,6 +30,7 @@
     "axios": "^1.15.2",
     "dotenv": "^17.4.2",
     "fastify": "^5.8.5",
+    "jsonwebtoken": "^9.0.3",
     "knex": "^3.2.9",
     "pg": "^8.20.0",
     "uuidv7": "^1.2.1"
