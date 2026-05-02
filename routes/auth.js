@@ -125,8 +125,10 @@ export async function authRoutes(fastify) {
                     path: '/',
                     maxAge: 5 * 60,
                 });
-
-            return reply.redirect(`${FRONTEND_URL}/dashboard.html`);
+            // Web: redirect with tokens in URL, let frontend store them
+            return reply.redirect(
+                `${FRONTEND_URL}/dashboard.html?access_token=${accessToken}&refresh_token=${refreshToken}`
+            );
         } catch (err) {
             fastify.log.error(err);
             return reply.status(502).send({ status: 'error', message: 'Authentication failed' });
