@@ -9,9 +9,24 @@ const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
 const GITHUB_CALLBACK_URL = process.env.GITHUB_CALLBACK_URL;
 const FRONTEND_URL = process.env.FRONTEND_URL;
 
+/**
+ * Cookie options — SameSite=none + Secure=true required for cross-origin
+ * deployments (Railway backend ↔ Railway web on different subdomains).
+ */
+function cookieOpts(maxAge) {
+    const isProd = process.env.NODE_ENV === 'production';
+    return {
+        httpOnly: true,
+        secure: isProd,              // SameSite=none requires Secure
+        sameSite: isProd ? 'none' : 'lax',
+        path: '/',
+        maxAge,                      // seconds
+    };
+}
+
 export async function authRoutes(fastify) {
 
-    // GET /auth/github — redirect to GitHub
+    // GET /auth/github — redirect user to GitHub OAuth consent screen
     fastify.get('/auth/github', async (request, reply) => {
         const state = uuidv7();
         const params = new URLSearchParams({
@@ -26,16 +41,16 @@ export async function authRoutes(fastify) {
         );
     });
 
-    // GET /auth/github/callback — handle OAuth callback
+    // GET /auth/github/callback — GitHub sends the user back here with a code
     fastify.get('/auth/github/callback', async (request, reply) => {
-        const { code, state } = request.query;
+        const { code, cli, port } = request.query;
 
         if (!code) {
             return reply.status(400).send({ status: 'error', message: 'Missing code' });
         }
 
         try {
-            // Exchange code for access token
+            // 1. Exchange code for GitHub access token
             const tokenRes = await axios.post(
                 'https://github.com/login/oauth/access_token',
                 {
@@ -52,7 +67,7 @@ export async function authRoutes(fastify) {
                 return reply.status(502).send({ status: 'error', message: 'GitHub token exchange failed' });
             }
 
-            // Get GitHub user info
+            // 2. Fetch GitHub user profile + primary email
             const [userRes, emailRes] = await Promise.all([
                 axios.get('https://api.github.com/user', {
                     headers: { Authorization: `Bearer ${githubToken}` },
@@ -65,7 +80,7 @@ export async function authRoutes(fastify) {
             const githubUser = userRes.data;
             const primaryEmail = emailRes.data.find((e) => e.primary)?.email || null;
 
-            // Upsert user
+            // 3. Upsert user in DB
             let user = await db('users').where({ github_id: String(githubUser.id) }).first();
 
             if (!user) {
@@ -95,48 +110,34 @@ export async function authRoutes(fastify) {
                 return reply.status(403).send({ status: 'error', message: 'Account is inactive' });
             }
 
+            // 4. Issue token pair
             const accessToken = signAccessToken(user);
             const refreshToken = await createRefreshToken(user.id);
 
-            // Check if CLI flow (has state param from CLI)
-            const isCLI = request.query.cli === '1';
-
-            if (isCLI) {
-                // CLI: redirect to localhost callback
-                const port = request.query.port || 9876;
+            // CLI flow: redirect tokens to the local callback server
+            if (cli === '1') {
+                const callbackPort = port || 9876;
                 return reply.redirect(
-                    `http://localhost:${port}/callback?access_token=${accessToken}&refresh_token=${refreshToken}&username=${user.username}`
+                    `http://localhost:${callbackPort}/callback?access_token=${accessToken}&refresh_token=${refreshToken}&username=${user.username}`
                 );
             }
 
-            // Web: set HTTP-only cookies
+            // Web flow: set HTTP-only cookies ONLY — no tokens exposed in URL
             reply
-                .setCookie('access_token', accessToken, {
-                    httpOnly: true,
-                    secure: process.env.NODE_ENV === 'production',
-                    sameSite: 'lax',
-                    path: '/',
-                    maxAge: 3 * 60,
-                })
-                .setCookie('refresh_token', refreshToken, {
-                    httpOnly: true,
-                    secure: process.env.NODE_ENV === 'production',
-                    sameSite: 'lax',
-                    path: '/',
-                    maxAge: 5 * 60,
-                });
-            // Web: redirect with tokens in URL, let frontend store them
-            return reply.redirect(
-                `${FRONTEND_URL}/dashboard.html?access_token=${accessToken}&refresh_token=${refreshToken}`
-            );
+                .setCookie('access_token', accessToken, cookieOpts(3 * 60))
+                .setCookie('refresh_token', refreshToken, cookieOpts(5 * 60));
+
+            return reply.redirect(`${FRONTEND_URL}/dashboard.html`);
+
         } catch (err) {
             fastify.log.error(err);
             return reply.status(502).send({ status: 'error', message: 'Authentication failed' });
         }
     });
 
-    // POST /auth/refresh
+    // POST /auth/refresh — rotate access + refresh token pair
     fastify.post('/auth/refresh', async (request, reply) => {
+        // Accept token from body (CLI) or cookie (web)
         const refreshToken =
             request.body?.refresh_token ||
             request.cookies?.refresh_token;
@@ -146,26 +147,12 @@ export async function authRoutes(fastify) {
         }
 
         try {
-            const { accessToken, refreshToken: newRefreshToken, user } = await rotateRefreshToken(refreshToken);
+            const { accessToken, refreshToken: newRefreshToken } = await rotateRefreshToken(refreshToken);
 
-            // Update cookie if web
-            if (request.cookies?.refresh_token) {
-                reply
-                    .setCookie('access_token', accessToken, {
-                        httpOnly: true,
-                        secure: process.env.NODE_ENV === 'production',
-                        sameSite: 'lax',
-                        path: '/',
-                        maxAge: 3 * 60,
-                    })
-                    .setCookie('refresh_token', newRefreshToken, {
-                        httpOnly: true,
-                        secure: process.env.NODE_ENV === 'production',
-                        sameSite: 'lax',
-                        path: '/',
-                        maxAge: 5 * 60,
-                    });
-            }
+            // Always refresh cookies (harmless for CLI, essential for web)
+            reply
+                .setCookie('access_token', accessToken, cookieOpts(3 * 60))
+                .setCookie('refresh_token', newRefreshToken, cookieOpts(5 * 60));
 
             return reply.send({
                 status: 'success',
@@ -180,7 +167,7 @@ export async function authRoutes(fastify) {
         }
     });
 
-    // POST /auth/logout
+    // POST /auth/logout — invalidate refresh token server-side + clear cookies
     fastify.post('/auth/logout', async (request, reply) => {
         const refreshToken =
             request.body?.refresh_token ||
@@ -191,14 +178,18 @@ export async function authRoutes(fastify) {
         }
 
         reply
-            .clearCookie('access_token')
-            .clearCookie('refresh_token');
+            .clearCookie('access_token', { path: '/' })
+            .clearCookie('refresh_token', { path: '/' });
 
         return reply.send({ status: 'success', message: 'Logged out' });
     });
 
-    // GET /auth/me
+    // GET /auth/me — return current authenticated user (no X-API-Version required)
     fastify.get('/auth/me', { preHandler: authenticate }, async (request, reply) => {
-        return reply.send({ status: 'success', data: request.user });
+        const { id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at } = request.user;
+        return reply.send({
+            status: 'success',
+            data: { id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at },
+        });
     });
 }

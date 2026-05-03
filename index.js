@@ -9,17 +9,28 @@ import { profileRoutes } from './routes/profiles.js';
 const fastify = Fastify({ logger: true });
 const PORT = parseInt(process.env.PORT) || 3000;
 
-// CORS
+// Allowed origins — comma-separated in env for flexibility
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL || 'http://localhost:5500')
+    .split(',')
+    .map(o => o.trim());
+
+// CORS — must use explicit origin list (not `true`) for credentials cookies to work cross-origin
 await fastify.register(cors, {
-    origin: true,
+    origin: (origin, cb) => {
+        // Allow requests with no origin (curl, mobile, server-to-server)
+        if (!origin) return cb(null, true);
+        if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+        cb(new Error(`CORS: origin ${origin} not allowed`), false);
+    },
     credentials: true,
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Version'],
 });
 
 // Cookies
 await fastify.register(cookie);
 
-// Rate limiting
+// Rate limiting global plugin (individual scopes set below)
 await fastify.register(rateLimit, {
     global: false,
 });
@@ -27,8 +38,8 @@ await fastify.register(rateLimit, {
 // Health check
 fastify.get('/health', async () => ({ status: 'ok' }));
 
-// Auth routes — rate limited at 10/min
-fastify.register(async (instance) => {
+// Auth routes — rate limited at 10 req/min
+await fastify.register(async (instance) => {
     await instance.register(rateLimit, {
         max: 10,
         timeWindow: '1 minute',
@@ -37,11 +48,11 @@ fastify.register(async (instance) => {
             message: 'Too many requests',
         }),
     });
-    instance.register(authRoutes);
+    await instance.register(authRoutes);
 }, { prefix: '' });
 
-// Profile routes — rate limited at 60/min
-fastify.register(async (instance) => {
+// Profile routes — rate limited at 60 req/min per user
+await fastify.register(async (instance) => {
     await instance.register(rateLimit, {
         max: 60,
         timeWindow: '1 minute',
@@ -50,10 +61,10 @@ fastify.register(async (instance) => {
             message: 'Too many requests',
         }),
     });
-    instance.register(profileRoutes);
+    await instance.register(profileRoutes);
 }, { prefix: '/api' });
 
-// Request logging
+// Request logging hook
 fastify.addHook('onResponse', (request, reply, done) => {
     fastify.log.info({
         method: request.method,
