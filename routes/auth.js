@@ -161,8 +161,8 @@ export async function authRoutes(fastify) {
             }
 
             reply
-                .setCookie('access_token', accessToken, cookieOpts(3 * 60))
-                .setCookie('refresh_token', refreshToken, cookieOpts(5 * 60));
+                .setCookie('access_token', accessToken, cookieOpts(15 * 60))
+                .setCookie('refresh_token', refreshToken, cookieOpts(7 * 24 * 60 * 60));
 
             return reply.redirect(
                 `${dashboardUrl}?access_token=${accessToken}&refresh_token=${refreshToken}`
@@ -190,8 +190,8 @@ export async function authRoutes(fastify) {
 
             // Always refresh cookies (harmless for CLI, essential for web)
             reply
-                .setCookie('access_token', accessToken, cookieOpts(3 * 60))
-                .setCookie('refresh_token', newRefreshToken, cookieOpts(5 * 60));
+                .setCookie('access_token', accessToken, cookieOpts(15 * 60))
+                .setCookie('refresh_token', newRefreshToken, cookieOpts(7 * 24 * 60 * 60));
 
             return reply.send({
                 status: 'success',
