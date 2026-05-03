@@ -141,12 +141,15 @@ export async function authRoutes(fastify) {
                 );
             }
 
-            // Web flow: set HTTP-only cookies ONLY — no tokens exposed in URL
+            // Web flow — put tokens in redirect URL so frontend can store in localStorage
+            // Also set cookies as backup (harmless)
             reply
                 .setCookie('access_token', accessToken, cookieOpts(3 * 60))
                 .setCookie('refresh_token', refreshToken, cookieOpts(5 * 60));
 
-            return reply.redirect(`${FRONTEND_URL}/dashboard.html`);
+            return reply.redirect(
+                `${FRONTEND_URL}/dashboard.html?access_token=${accessToken}&refresh_token=${refreshToken}`
+            );
 
         } catch (err) {
             fastify.log.error(err);

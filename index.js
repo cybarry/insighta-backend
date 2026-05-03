@@ -14,14 +14,9 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL
     .split(',')
     .map(o => o.trim());
 
-// CORS — must use explicit origin list (not `true`) for credentials cookies to work cross-origin
+// CORS — open to all origins; auth is via Authorization header, not cookies
 await fastify.register(cors, {
-    origin: (origin, cb) => {
-        // Allow requests with no origin (curl, mobile, server-to-server)
-        if (!origin) return cb(null, true);
-        if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-        cb(new Error(`CORS: origin ${origin} not allowed`), false);
-    },
+    origin: true,
     credentials: true,
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Version'],
