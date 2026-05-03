@@ -28,7 +28,15 @@ export async function authRoutes(fastify) {
 
     // GET /auth/github — redirect user to GitHub OAuth consent screen
     fastify.get('/auth/github', async (request, reply) => {
-        const state = uuidv7();
+        // Encode cli/port into state so they survive the GitHub round-trip.
+        // GitHub only passes back `code` and `state` — all other query params are lost.
+        const statePayload = {
+            nonce: uuidv7(),
+            cli: request.query.cli || null,
+            port: request.query.port || null,
+        };
+        const state = Buffer.from(JSON.stringify(statePayload)).toString('base64url');
+
         const params = new URLSearchParams({
             client_id: GITHUB_CLIENT_ID,
             redirect_uri: GITHUB_CALLBACK_URL,
@@ -43,10 +51,21 @@ export async function authRoutes(fastify) {
 
     // GET /auth/github/callback — GitHub sends the user back here with a code
     fastify.get('/auth/github/callback', async (request, reply) => {
-        const { code, cli, port } = request.query;
+        const { code, state: rawState } = request.query;
 
         if (!code) {
             return reply.status(400).send({ status: 'error', message: 'Missing code' });
+        }
+
+        // Decode cli/port from state (encoded in /auth/github above)
+        let cli = null;
+        let port = null;
+        try {
+            const statePayload = JSON.parse(Buffer.from(rawState, 'base64url').toString());
+            cli = statePayload.cli;
+            port = statePayload.port;
+        } catch {
+            // state was not base64-encoded (e.g. direct browser hit) — that's fine
         }
 
         try {
