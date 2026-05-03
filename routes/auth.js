@@ -28,12 +28,13 @@ export async function authRoutes(fastify) {
 
     // GET /auth/github — redirect user to GitHub OAuth consent screen
     fastify.get('/auth/github', async (request, reply) => {
-        // Encode cli/port into state so they survive the GitHub round-trip.
+        // Encode cli/port/redirect_to into state so they survive the GitHub round-trip.
         // GitHub only passes back `code` and `state` — all other query params are lost.
         const statePayload = {
             nonce: uuidv7(),
             cli: request.query.cli || null,
             port: request.query.port || null,
+            redirect_to: request.query.redirect_to || null,
         };
         const state = Buffer.from(JSON.stringify(statePayload)).toString('base64url');
 
@@ -57,13 +58,15 @@ export async function authRoutes(fastify) {
             return reply.status(400).send({ status: 'error', message: 'Missing code' });
         }
 
-        // Decode cli/port from state (encoded in /auth/github above)
+        // Decode cli/port/redirect_to from state (encoded in /auth/github above)
         let cli = null;
         let port = null;
+        let redirect_to = null;
         try {
             const statePayload = JSON.parse(Buffer.from(rawState, 'base64url').toString());
             cli = statePayload.cli;
             port = statePayload.port;
+            redirect_to = statePayload.redirect_to;
         } catch {
             // state was not base64-encoded (e.g. direct browser hit) — that's fine
         }
@@ -141,14 +144,28 @@ export async function authRoutes(fastify) {
                 );
             }
 
-            // Web flow — put tokens in redirect URL so frontend can store in localStorage
-            // Also set cookies as backup (harmless)
+            // Web flow — redirect to frontend with tokens in URL for localStorage storage.
+            // Use redirect_to from state if provided, otherwise fall back to FRONTEND_URL env var.
+            const SAFE_ORIGINS = [
+                'https://insighta-web-production-418d.up.railway.app',
+                'http://localhost:5500',
+                'http://localhost:3001',
+            ];
+
+            let dashboardUrl = `${FRONTEND_URL}/dashboard.html`;
+
+            if (redirect_to) {
+                // Validate redirect_to is a known-safe origin (prevent open redirect)
+                const isSafe = SAFE_ORIGINS.some(o => redirect_to.startsWith(o));
+                if (isSafe) dashboardUrl = redirect_to;
+            }
+
             reply
                 .setCookie('access_token', accessToken, cookieOpts(3 * 60))
                 .setCookie('refresh_token', refreshToken, cookieOpts(5 * 60));
 
             return reply.redirect(
-                `${FRONTEND_URL}/dashboard.html?access_token=${accessToken}&refresh_token=${refreshToken}`
+                `${dashboardUrl}?access_token=${accessToken}&refresh_token=${refreshToken}`
             );
 
         } catch (err) {
