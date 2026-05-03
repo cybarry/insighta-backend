@@ -152,7 +152,7 @@ export async function authRoutes(fastify) {
                 'http://localhost:3001',
             ];
 
-            let dashboardUrl = `${FRONTEND_URL}/dashboard.html`;
+            let dashboardUrl = `${FRONTEND_URL}/dashboard`;
 
             if (redirect_to) {
                 // Validate redirect_to is a known-safe origin (prevent open redirect)
