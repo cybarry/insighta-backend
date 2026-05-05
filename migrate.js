@@ -23,8 +23,11 @@ async function migrate() {
             t.string('country_name').notNullable();
             t.float('country_probability').notNullable();
             t.timestamp('created_at').defaultTo(db.fn.now());
-            t.index(['gender', 'age_group', 'country_id', 'age',
-                'gender_probability', 'country_probability', 'created_at']);
+            t.index(['gender', 'country_id'], 'idx_gender_country');
+            t.index(['gender', 'age_group'], 'idx_gender_age_group');
+            t.index(['country_id', 'age_group'], 'idx_country_age_group');
+            t.index(['gender', 'country_id', 'age_group'], 'idx_gender_country_age_group');
+            t.index(['created_at'], 'idx_created_at');
         });
         console.log('✅ profiles table created');
     } else {

@@ -3,6 +3,9 @@ import { uuidv7 } from 'uuidv7';
 import { db } from '../lib/db.js';
 import { authenticate, requireRole, requireApiVersion } from '../lib/middleware.js';
 import { parseQuery } from '../lib/nlp.js';
+import csv from 'csv-parser';
+import { getCached, setCached, clearCache } from '../lib/cache.js';
+import { normalizeQuery } from '../lib/normalize.js';
 
 const VALID_SORT = new Set(['age', 'created_at', 'gender_probability']);
 const VALID_ORDERS = new Set(['asc', 'desc']);
@@ -133,11 +136,113 @@ export async function profileRoutes(fastify) {
             })
             .returning('*');
 
+        clearCache();
         return reply.status(201).send({ status: 'success', data: profile });
+    });
+
+    // POST /api/profiles/upload — admin only
+    fastify.post('/profiles/upload', {
+        preHandler: requireRole('admin'),
+    }, async (request, reply) => {
+        const data = await request.file();
+        if (!data) {
+            return reply.status(400).send({ status: 'error', message: 'Missing file' });
+        }
+
+        let total_rows = 0;
+        let inserted = 0;
+        let skipped = 0;
+        const reasons = { duplicate_name: 0, invalid_age: 0, missing_fields: 0, malformed: 0 };
+        
+        const validGenders = new Set(['male', 'female']);
+        let batch = [];
+        const BATCH_SIZE = 1000;
+
+        async function processBatch() {
+            if (batch.length === 0) return;
+            try {
+                const results = await db('profiles')
+                    .insert(batch)
+                    .onConflict('name')
+                    .ignore()
+                    .returning('id');
+                    
+                inserted += results.length;
+                reasons.duplicate_name += (batch.length - results.length);
+                skipped += (batch.length - results.length);
+            } catch (err) {
+                skipped += batch.length;
+                reasons.malformed += batch.length;
+                request.log.error('Batch insert error:', err);
+            }
+            batch = [];
+            await new Promise(resolve => setImmediate(resolve));
+        }
+
+        const parser = data.file.pipe(csv({ separator: ',' }));
+        
+        for await (const row of parser) {
+            total_rows++;
+            
+            const name = row.name?.trim();
+            const gender = row.gender?.trim().toLowerCase();
+            const age = parseInt(row.age, 10);
+            const country_id = row.country_id?.trim().toUpperCase();
+            const country_name = row.country_name?.trim() || country_id;
+
+            if (!name || !gender || isNaN(age) || !country_id) {
+                skipped++;
+                reasons.missing_fields++;
+                continue;
+            }
+            if (age < 0) {
+                skipped++;
+                reasons.invalid_age++;
+                continue;
+            }
+            if (!validGenders.has(gender)) {
+                skipped++;
+                reasons.malformed++;
+                continue;
+            }
+
+            const age_group = getAgeGroup(age);
+
+            batch.push({
+                id: uuidv7(),
+                name: name.toLowerCase(),
+                gender: gender,
+                gender_probability: parseFloat(row.gender_probability) || 1.0,
+                age: age,
+                age_group: age_group,
+                country_id: country_id,
+                country_name: country_name,
+                country_probability: parseFloat(row.country_probability) || 1.0
+            });
+
+            if (batch.length >= BATCH_SIZE) {
+                await processBatch();
+            }
+        }
+        
+        await processBatch(); // Final batch
+        clearCache(); // Invalidate cache after bulk insert
+
+        return reply.send({
+            status: "success",
+            total_rows,
+            inserted,
+            skipped,
+            reasons
+        });
     });
 
     // GET /api/profiles
     fastify.get('/profiles', async (request, reply) => {
+        const cacheKey = `profiles_${normalizeQuery(request.query)}`;
+        const cached = getCached(cacheKey);
+        if (cached) return reply.send(cached);
+
         const { page, limit, offset } = parsePagination(request.query);
         const sortBy = VALID_SORT.has(request.query.sort_by) ? request.query.sort_by : 'created_at';
         const order = VALID_ORDERS.has(request.query.order?.toLowerCase()) ? request.query.order.toLowerCase() : 'desc';
@@ -149,7 +254,7 @@ export async function profileRoutes(fastify) {
         const total = parseInt(count);
         const data = await base.clone().orderBy(sortBy, order).limit(limit).offset(offset);
 
-        return reply.send({
+        const response = {
             status: 'success',
             page,
             limit,
@@ -157,7 +262,10 @@ export async function profileRoutes(fastify) {
             total_pages: Math.ceil(total / limit),
             links: buildLinks('/api/profiles', page, limit, total),
             data,
-        });
+        };
+        
+        setCached(cacheKey, response);
+        return reply.send(response);
     });
 
     // GET /api/profiles/export
@@ -175,7 +283,7 @@ export async function profileRoutes(fastify) {
         const headers = ['id', 'name', 'gender', 'gender_probability', 'age', 'age_group',
             'country_id', 'country_name', 'country_probability', 'created_at'];
 
-        const csv = [
+        const csvString = [
             headers.join(','),
             ...data.map(row => headers.map(h => `"${row[h] ?? ''}"`).join(',')),
         ].join('\n');
@@ -183,7 +291,7 @@ export async function profileRoutes(fastify) {
         reply
             .header('Content-Type', 'text/csv')
             .header('Content-Disposition', `attachment; filename="${filename}"`)
-            .send(csv);
+            .send(csvString);
     });
 
     // GET /api/profiles/search
@@ -200,6 +308,11 @@ export async function profileRoutes(fastify) {
         }
 
         const { page, limit, offset } = parsePagination(request.query);
+        
+        const cacheKey = `search_${normalizeQuery({ ...filters, page, limit })}`;
+        const cached = getCached(cacheKey);
+        if (cached) return reply.send(cached);
+
         const base = db('profiles');
         applyFilters(base, filters);
 
@@ -207,7 +320,7 @@ export async function profileRoutes(fastify) {
         const total = parseInt(count);
         const data = await base.clone().orderBy('created_at', 'desc').limit(limit).offset(offset);
 
-        return reply.send({
+        const response = {
             status: 'success',
             page,
             limit,
@@ -215,16 +328,26 @@ export async function profileRoutes(fastify) {
             total_pages: Math.ceil(total / limit),
             links: buildLinks('/api/profiles/search', page, limit, total),
             data,
-        });
+        };
+        
+        setCached(cacheKey, response);
+        return reply.send(response);
     });
 
     // GET /api/profiles/:id
     fastify.get('/profiles/:id', async (request, reply) => {
+        const cacheKey = `profile_${request.params.id}`;
+        const cached = getCached(cacheKey);
+        if (cached) return reply.send(cached);
+
         const profile = await db('profiles').where({ id: request.params.id }).first();
         if (!profile) {
             return reply.status(404).send({ status: 'error', message: 'Profile not found' });
         }
-        return reply.send({ status: 'success', data: profile });
+        
+        const response = { status: 'success', data: profile };
+        setCached(cacheKey, response);
+        return reply.send(response);
     });
 
     // DELETE /api/profiles/:id — admin only
@@ -235,6 +358,7 @@ export async function profileRoutes(fastify) {
         if (!deleted) {
             return reply.status(404).send({ status: 'error', message: 'Profile not found' });
         }
+        clearCache();
         return reply.status(204).send();
     });
 }

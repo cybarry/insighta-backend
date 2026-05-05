@@ -3,6 +3,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
+import multipart from '@fastify/multipart';
 import { authRoutes } from './routes/auth.js';
 import { profileRoutes } from './routes/profiles.js';
 
@@ -24,6 +25,9 @@ await fastify.register(cors, {
 
 // Cookies
 await fastify.register(cookie);
+
+// Multipart for CSV uploads
+await fastify.register(multipart);
 
 // Rate limiting global plugin (individual scopes set below)
 await fastify.register(rateLimit, {
