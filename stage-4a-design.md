@@ -39,10 +39,9 @@
 graph TD
     Client[Clients: Web Portal, CLI, Direct API] --> |HTTPS| Proxy[Nginx Reverse Proxy + Rate Limiter]
     Proxy --> API[Fastify API Server Node.js]
-    API --> |Read Queries| Cache[(Redis Cache)]
-    API --> |Write Path / Ingest| DBMaster[(PostgreSQL Master)]
-    API --> |Read Cache Miss| DBSlave[(PostgreSQL Slave)]
-    DBMaster --> |Async Replication| DBSlave
+    API --> |Read Queries| Cache[(In-Memory LRU Cache)]
+    API --> |Write Path / Ingest| DB[(PostgreSQL + Connection Pool)]
+    API --> |Read Cache Miss| DB
 ```
 
 ### Core Components
@@ -51,11 +50,9 @@ graph TD
 
 **API Server (Fastify):** Handles auth verification, role checks, API versioning, and routes requests to the correct handler. Stateless — holds no data, only processes requests.
 
-**Redis Cache:** Stores results of frequent read queries in memory (RAM). Serving from RAM is orders of magnitude faster than querying the database on disk. Used as a server-side cache sitting in front of the read replica.
+**In-Memory LRU Cache:** Stores results of frequent read queries directly in the Node.js process RAM (via `lru-cache`). This avoids external DB dependencies while delivering sub-10ms response times for repeated queries.
 
-**PostgreSQL Master:** Handles all write operations (INSERT, UPDATE, DELETE). Admin-only profile creation goes here. Only one master is needed — write volume is low.
-
-**PostgreSQL Slave (Read Replica):** Handles all read queries. Receives data from the master via asynchronous replication. All analyst queries — filter, search, export — go here. Separating reads and writes is the master-slave architecture pattern.
+**PostgreSQL (with Connection Pooling):** Handles both reads and writes. To support concurrency without connection starvation, the Knex adapter utilizes connection pooling (`min: 2, max: 20`). Composite indexes are explicitly created for common analytical intersections.
 
 ---
 
@@ -83,18 +80,19 @@ sequenceDiagram
     participant C as Analyst
     participant N as Nginx Proxy
     participant A as API Server Fastify
-    participant R as Redis Cache
-    participant DB as DB Slave (Read Replica)
+    participant R as In-Memory LRU Cache
+    participant DB as PostgreSQL Database
 
     C->>N: Request (GET /api/profiles)
     N->>A: Forward Request
     A->>A: Verify Auth, Role, Headers
-    A->>A: Parse Filters & Build Cache Key
+    A->>A: Parse Filters & Normalize Deterministically
+    A->>A: Build Canonical Cache Key
     A->>R: Check Cache
     alt Cache Hit
         R-->>A: Return Result
     else Cache Miss
-        A->>DB: Execute Query (with indexes)
+        A->>DB: Execute Query (with composite indexes)
         DB-->>A: Return Data
         A->>R: Store Result (TTL: 60s)
     end
@@ -107,17 +105,16 @@ sequenceDiagram
 sequenceDiagram
     participant C as Admin
     participant A as API Server
-    participant DB as DB Master
-    participant DBS as DB Slave
-    participant R as Redis Cache
+    participant DB as PostgreSQL Database
+    participant R as LRU Cache
 
-    C->>A: POST /api/profiles
-    A->>A: Verify Admin Role & duplicates
-    A->>A: Parallel external API calls
-    A->>DB: INSERT profile record
-    DB--)DBS: Async replication
-    A->>R: Invalidate affected cache keys
-    A-->>C: Return 201
+    C->>A: POST /api/profiles/upload (CSV Stream)
+    A->>A: Verify Admin Role
+    A->>A: Parse CSV stream & validate rows on-the-fly
+    A->>DB: Batch INSERT (1000 rows) ON CONFLICT DO NOTHING
+    A->>A: Yield Event Loop
+    A->>R: Invalidate cache (clearCache)
+    A-->>C: Return JSON summary (inserted, skipped, reasons)
 ```
 
 ### Natural Language Query Flow
@@ -138,33 +135,27 @@ sequenceDiagram
 
 ## 5. Design Decisions
 
-### Decision 1 — Vertical Scaling First, Then Master-Slave
+### Decision 1 — Vertical Scaling & Connection Pooling (No New Infrastructure)
 
 **Requirement:** Handle hundreds to thousands of queries per minute with P95 < 2s.
 
-**Reasoning:** The first step when a database becomes slow is always vertical scaling — increase the RAM and CPU of the existing server. It is the simplest option and has no application-level changes. Only after hitting that limit does it make sense to add complexity.
+**Reasoning:** To meet the strict "no new database systems" constraint from Stage 4B, we avoided provisioning a Master-Slave cluster. Instead, we scaled our single database connection via Knex connection pooling (`min: 2, max: 20`). This handles high concurrency efficiently while maintaining a simpler infrastructure footprint.
 
-For this system, the bottleneck will be read traffic — analysts constantly querying the same dataset. The master-slave architecture is the correct next step: one master handles all writes, one or more slaves handle all reads. This directly reduces contention because read and write traffic no longer compete for the same database connections.
-
-Sharding is not needed here. The resource says: "When you have write-heavy traffic, do sharding." This system has write-light traffic (admin-only, occasional profile creation). Sharding would be overengineering and would introduce the join complexity the resource explicitly warns against.
-
-**Trade-off:** Asynchronous replication means the slave may lag behind the master by milliseconds to seconds. A profile created right now may not appear in search results immediately. This is acceptable for an analytics system and is the definition of eventual consistency.
+**Trade-off:** A single database node represents a single point of failure and mixes read/write contention. We mitigate write contention during heavy CSV ingestion by batching inserts and yielding the Node event loop, allowing read queries to interleave without starvation.
 
 ---
 
-### Decision 2 — Redis as Server-Side Cache
+### Decision 2 — In-Memory LRU Cache + Query Normalization
 
-**Requirement:** P50 < 500ms, reduced database load.
+**Requirement:** P50 < 500ms, reduced database load without external caching infrastructure.
 
-**Reasoning:** The resource explains that Redis stores data in RAM, which is dramatically faster than reading from disk (where the database lives). A query that takes 200ms against the database returns in under 10ms from Redis.
+**Reasoning:** Since we cannot use an external Redis cluster, we implemented `lru-cache` within the Node.js process itself. Serving from RAM is orders of magnitude faster than querying disk.
 
-Analyst queries follow predictable patterns — "show me adult males from Nigeria" will be run many times per day. Without caching, every single request hits the read replica. With a 60-second TTL cache, the first request pays the database cost and every subsequent identical request is served from memory.
+To maximize cache hit rates, a **deterministic query normalizer** was built. It sorts and standardizes filter keys before generating the cache key. Thus, "Nigerian females aged 20-45" and "Women 20-45 in Nigeria" hit the exact same cache block, heavily reducing redundant DB execution.
 
-The cache key is built from the full combination of query parameters (filters + sort + page + limit). An exact match returns cached data. A miss falls through to the read replica.
+**On write:** Any `POST`, `DELETE`, or bulk CSV `upload` operations invoke a global `clearCache()` to ensure data consistency without overcomplicating cache invalidation tracking.
 
-**On write:** When an admin creates or deletes a profile, cache entries that would be affected by that change are invalidated immediately. This prevents stale results from being served after a data change.
-
-**Trade-off:** Up to 60 seconds of staleness after a write. Acceptable for analytics. A shorter TTL (e.g., 10 seconds) reduces staleness but increases database load. 60 seconds is the practical balance for this use case.
+**Trade-off:** Local memory caches are bound to the Node process. If deployed across multiple isolated containers, cache state isn't shared (though eventually consistent). Clearing the entire cache on writes is a blunt invalidation tool, but practical given the massive read-heavy skew of the system.
 
 ---
 
